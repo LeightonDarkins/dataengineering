@@ -532,3 +532,232 @@ SELECT * FROM ranked_order_revenue
 	WHERE rnk <= 5
 	ORDER BY order_date, order_revenue DESC;
 ```
+
+## Performance Tuning SQL Queries
+
+### Common Scenarios for Performance Tuning
+
+ECommerce, ensuring speed of retireving Orders for a specific Customer without having to read through every Order ever made.
+
+### Order of Operations
+
+When you want to improve the performance of an SQL query this is what you should do:
+
+1. Generate and View Query Plan
+2. Interpret Query Plan
+3. Identify Bottlenecks
+4. Mitigate Bottlenecks
+
+### Compilation and Execution of SQL Queries
+
+When you run and SQL query, this is what happens:
+
+1. Syntax and Semantics Checks
+2. Generate Query Plans
+3. Choose the Optimal Query Plan
+4. Execute the chosen Query Plan
+
+### When to add Indexes
+
+Whenever you're commonly JOINing table, you likely need an INDEX.
+
+INDEXes slow down writes though, so be careful not to add too many.
+
+### Generating Query Plans
+
+To generate a Query Plan, place the EXPLAIN keyword prior to the query you want to analyze.
+
+PGAdmin also has an Explain and Explain/Analyze button in the Query window to generate the same output and other helpful visuals
+
+A query like this:
+
+```
+EXPLAIN
+SELECT o.*,
+	round(sum(oi.order_item_subtotal)::numeric, 2) AS revenue
+FROM orders AS o
+	JOIN order_items AS oi
+		ON o.order_id = oi.order_item_order_id
+WHERE order_id = 2
+GROUP BY o.order_id,
+o.order_date,
+o.order_customer_id,
+o.order_status;
+```
+
+will generate a Query Plan that looks like this:
+
+```
+                                      QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ GroupAggregate  (cost=0.29..3427.86 rows=1 width=58)
+   Group Key: o.order_id
+   ->  Nested Loop  (cost=0.29..3427.82 rows=4 width=34)
+         ->  Index Scan using orders_pkey on orders o  (cost=0.29..8.31 rows=1 width=26)
+               Index Cond: (order_id = 2)
+         ->  Seq Scan on order_items oi  (cost=0.00..3419.47 rows=4 width=12)
+               Filter: (order_item_order_id = 2)
+
+```
+
+#### Query Plan Terms
+
+- Tree: Represents the whole structure
+- Root: A node on the Tree with no Parent
+- Branch: A node on the Tree with Children
+- Leaves: Have no Children, the end of the Tree structure.
+
+Leaves execute first, then execution cascades upwards through the Branches back to the Root
+
+#### Interpreting Query Plans - Example 1
+
+``SELECT count(*) FROM orders WHERE ordeR_id = 2;``
+
+turns into
+
+```
+-> Aggregate
+    -> Index Only Scan using orders_pkey on orders as orders
+        Index Cond: (order_id = 2)
+```
+
+breaking that down looks like:
+
+- Index Cond: (order_id = 2): Find order_id 2 in the index orders_pkey
+- Index Only Scan: Only pull the Index ID, we don't need the underlying data
+- Aggregate: do whatever aggregate action (in this case count(*))
+
+#### Interpreting Query Plans - Example 2
+
+``SELECT * FROM orders WHERE order_id = 2;``
+
+turns into
+
+```
+-> Index Scan using orders_pkey on orders as orders (rows=1 loops=1)
+    Index Cond: (order_id = 2)
+```
+
+breaking down the new items in this example:
+
+- Index Scan: Find the index, then pull the data from the underlying table location.
+
+#### Interpreting Query Plans - Example 3
+
+``SELECT count(*) from order_items WHERE order_item_order_id = 2;``
+
+turns into
+
+```
+-> Aggregate (rows=1 loops=1)
+	-> Seq Scan on order_items as order_items (rows=3 loops=1)
+	Filter: (order_item_order_id = 2)
+```
+
+breaking down the new items in this example:
+
+- Seq Scan: Read all of the data from order_items (full table scan)
+- Filter: Indicates the filter in the WHERE clause
+
+
+### Table Analysis and Actions
+
+#### Tables and Indexes
+
+The Primary Key is a value on a Table that is never NULL and always Unique.
+
+An INDEX makes searching for data faster by storing references to a Table Key (like the Primary Key) in an ordered list, with a reference to the row in the source table where the data is.
+
+The ordered nature of an INDEX means that you can avoid "full table scans" or having to read every value from a Table to find the data you want.
+
+#### Dropping Indexes
+
+```
+DROP INDEX orders_order_date_idx;
+
+COMMIT;
+```
+
+#### Adding Foreign Keys (FKs)
+
+```
+ALTER TABLE order_items ADD
+    FOREIGN KEY (order_item_order_id) REFERENCES order (order_id);
+```
+
+### Performance Tuning Worked Example
+
+#### Getting Orders
+
+``SELECT * FROM orders WHERE order_customer_id = 5;``
+
+```
+-> Seq Scan on orders as orders
+	Filter: (order_customer_id = 5);
+```
+
+There's a Full Table Scan on Orders here, that's not optimal.
+
+#### Getting Orders and Order Item Details
+
+```
+SELECT o.*,
+	oi.*
+FROM orders as o
+	JOIN order_items as oi
+		ON o.order_id = oi.order_item_order_id
+WHERE o.order_customer_id = 5;
+```
+
+```
+-> Hash Inner Join
+	-> Seq Scan on order_items
+	-> Hash
+		-> Seq Scan on orders
+```
+
+now there's a Full Table Scan acros both Orders and Order Items, our Query is getting exponentially worse.
+
+#### Adding FKs and Indexes for Performance
+
+```
+ALTER TABLE orders
+	ADD FOREIGN KEY (order_customer_id) REFERENCES customers (customer_id);
+
+CREATE INDEX order_order_customer_id_idx
+ON orders (order_customer_id);
+```
+
+our Query Plan now looks like:
+
+```
+-> Hash Inner Join
+	-> Seq Scan on order_items
+	-> Hash
+		-> Bitmap Heap Scan on orders
+			-> Bitmap Index Scan on order_order_customer_id_idx
+```
+
+we've removed on Full Table Scan
+
+#### Adding another Index for Performance
+
+```
+CREATE INDEX order_items_order_item_order_id_idx
+ON order_items (order_item_order_id)
+```
+
+our Query Plan now looks like:
+
+```
+-> Nested Loop Inner Join
+	-> Bitmap Heap Scan on orders
+		-> Bitmap Index Scan using order_order_customer_id_idx
+	-> Index Scan using order_items_order_item_order_id_idx on order_items
+```
+
+another Full Table Scan has been removed. There's some new items in the Query Plan, this is what they mean:
+
+- Index Scan: Find the item in the index, pull the data from the source table
+- Heap Scan: Read over a list of items in memory (from the Child Bitmap Index Scan)
+- Nested Loop: For each item in the Child Heap Scan, execute the Child Index Scan
